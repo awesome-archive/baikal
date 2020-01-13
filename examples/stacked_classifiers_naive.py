@@ -6,7 +6,7 @@ from sklearn.model_selection import train_test_split
 
 from baikal import Input, Model, make_step
 from baikal.plot import plot_model
-from baikal.steps import Concatenate
+from baikal.steps import ColumnStack, Lambda
 
 
 # ------- Define steps
@@ -24,13 +24,18 @@ X_train, X_test, y_train, y_test = train_test_split(
 # ------- Build model
 x = Input()
 y_t = Input()
-y_p1 = LogisticRegression(function="predict_proba")(x, y_t)
-y_p2 = RandomForestClassifier(function="predict_proba")(x, y_t)
-ensemble_features = Concatenate()([y_p1, y_p2])
-y_p = ExtraTreesClassifier()(ensemble_features, y_t)
+y_p1 = LogisticRegression(solver="liblinear", random_state=0)(
+    x, y_t, compute_func="predict_proba"
+)
+y_p2 = RandomForestClassifier(random_state=0)(x, y_t, compute_func="predict_proba")
+# predict_proba returns arrays whose columns sum to one, so we drop one column
+y_p1 = Lambda(lambda array: array[:, 1:])(y_p1)
+y_p2 = Lambda(lambda array: array[:, 1:])(y_p2)
+stacked_features = ColumnStack()([y_p1, y_p2])
+y_p = ExtraTreesClassifier(random_state=0)(stacked_features, y_t)
 
 model = Model(x, y_p, y_t)
-plot_model(model, filename="stacked_classifiers.png", dpi=96)
+plot_model(model, filename="stacked_classifiers_naive.png", dpi=96)
 
 # ------- Train model
 model.fit(X_train, y_train)

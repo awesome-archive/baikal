@@ -8,11 +8,12 @@ from tests.helpers.fixtures import teardown
 
 
 def test_lambda(teardown):
-    def function(x1, x2, p1, p2=1):
+    def compute_func(Xs, p1, p2=1):
+        x1, x2 = Xs
         return p1 * x1, x2 / p2
 
     x = Input()
-    y1, y2 = Lambda(function, n_outputs=2, p1=2, p2=2)([x, x])
+    y1, y2 = Lambda(compute_func, p1=2, p2=2, n_outputs=2)([x, x])
     model = Model(x, [y1, y2])
 
     x_data = np.array([[1.0, 2.0], [3.0, 4.0]])

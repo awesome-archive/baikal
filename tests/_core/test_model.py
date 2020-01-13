@@ -6,24 +6,27 @@ from typing import List, Dict
 import joblib
 import numpy as np
 import pytest
-import sklearn.decomposition
 import sklearn.ensemble
 import sklearn.linear_model
 from numpy.testing import assert_array_equal, assert_allclose
 from sklearn import datasets
 from sklearn.exceptions import NotFittedError
-from sklearn.pipeline import Pipeline
+from sklearn.model_selection import train_test_split
+from sklearn.pipeline import make_pipeline, Pipeline
 
 from baikal import Model, Input
 from baikal._core.data_placeholder import DataPlaceholder
 from baikal._core.typing import ArrayLike
-from baikal.steps import Concatenate, Stack, Lambda
+from baikal.steps import Concatenate, ColumnStack, Stack, Lambda
 
 from tests.helpers.fixtures import teardown
 from tests.helpers.sklearn_steps import (
     LinearRegression,
     LogisticRegression,
+    LinearSVC,
+    LinearSVCOOF,
     RandomForestClassifier,
+    RandomForestClassifierOOF,
     ExtraTreesClassifier,
     PCA,
     LabelEncoder,
@@ -34,13 +37,12 @@ from tests.helpers.dummy_steps import (
     DummySIMO,
     DummyMISO,
     DummyImproperlyDefined,
+    DummyEstimator,
 )
 
-pytestmark = pytest.mark.filterwarnings(
-    "ignore::DeprecationWarning:sklearn", "ignore::FutureWarning:sklearn"
-)
 
 iris = datasets.load_iris()
+breast_cancer = datasets.load_breast_cancer()
 
 
 @contextmanager
@@ -48,7 +50,17 @@ def does_not_raise():
     yield
 
 
-# TODO: Use only ValueError for erros in __init__, fit and predict
+skip_sklearn_0_22 = pytest.mark.skipif(
+    sklearn.__version__ == "0.22",
+    reason="sklearn.utils.validation.check_is_fitted in 0.22 yields false positives "
+    "when the class has private attributes."
+    "see: https://github.com/scikit-learn/scikit-learn/issues/15845",
+)
+
+skip_sklearn_pre_0_22 = pytest.mark.skipif(
+    sklearn.__version__ < "0.22",
+    reason="StackingClassifier is not available prior to 0.22 ",
+)
 
 
 class TestInit:
@@ -61,7 +73,7 @@ class TestInit:
         y_t_encoded = LabelEncoder()(y_t)
         z = Concatenate()([x1_transformed, x2])
         y = LogisticRegression()(z, y_t_encoded)
-        # TODO: support shareable steps to reuse LabelEncoder(function="inverse_transform")
+        # TODO: support shareable steps to reuse LabelEncoder with compute_func="inverse_transform"
 
         # full model
         Model([x1, x2], y, y_t)
@@ -101,7 +113,7 @@ class TestInit:
     def test_with_missing_targets(self, step_class, trainable, teardown):
         x = Input()
         y_t = Input()
-        y = step_class(trainable=trainable)(x, y_t)
+        y = step_class()(x, y_t, trainable=trainable)
         with pytest.raises(ValueError):
             Model(x, y)
 
@@ -124,7 +136,7 @@ class TestInit:
     def test_with_unnecessary_targets(self, step_class, trainable, teardown):
         x = Input()
         y_t = Input()
-        y = step_class(trainable=trainable)(x)
+        y = step_class()(x, trainable=trainable)
         with pytest.raises(ValueError):
             Model(x, y, y_t)  # y_t was not used anywhere
 
@@ -251,7 +263,7 @@ class TestFit:
 
     def test_with_undefined_target(self, teardown):
         x = Input()
-        y = LogisticRegression(trainable=True)(x)
+        y = LogisticRegression()(x, trainable=True)
         model = Model(inputs=x, outputs=y)
         with pytest.raises(TypeError):
             # LogisticRegression.fit will be called with not enough arguments
@@ -261,9 +273,9 @@ class TestFit:
     def test_with_unnecessarily_defined_but_missing_target(self, teardown):
         x = Input()
         y_t = Input()
-        pca = PCA(trainable=True)
+        pca = PCA()
         # The target passed to PCA is unnecessary (see notes in Step.__call__)
-        y = pca(x, y_t)
+        y = pca(x, y_t, trainable=True)
         model = Model(inputs=x, outputs=y, targets=y_t)
         with pytest.raises(ValueError):
             # fails because of the model target specification and trainable=True
@@ -272,28 +284,29 @@ class TestFit:
     def test_with_unnecessary_target(self, teardown):
         x = Input()
         y_t = Input()
-        logreg = LogisticRegression()
-        y_p = logreg(x, y_t)
+        classifier = RandomForestClassifier()
+        y_p = classifier(x, y_t)
         model = Model(x, y_p, y_t)
 
         model.fit(iris.data, iris.target)
 
         # won't require the target is trainable was set to False,
         # but won't complain if it was passed to fit
-        logreg.trainable = False
+        classifier.trainable = False
         model.fit(iris.data, iris.target)
 
     def test_with_non_trainable_step(self, teardown):
         x = Input()
-        y = PCA(trainable=False)(x)
+        y = PCA()(x, trainable=False)
         model = Model(x, y)
         # this should not raise an error because PCA has no successor steps
         model.fit(iris.data)
 
+    @skip_sklearn_0_22
     def test_with_non_fitted_non_trainable_step(self, teardown):
         x = Input()
         y_t = Input()
-        z = PCA(trainable=False)(x)
+        z = PCA()(x, trainable=False)
         y = LogisticRegression()(z, y_t)
         model = Model(x, y, y_t)
         with pytest.raises(NotFittedError):
@@ -312,9 +325,50 @@ class TestFit:
     def test_with_superfluous_target(self, step_class, trainable, teardown):
         x = Input()
         y_t = Input()
-        z = step_class(trainable=trainable)(x, y_t)
+        z = step_class()(x, y_t, trainable=trainable)
         model = Model(x, z, y_t)
         model.fit(iris.data, iris.target)  # should not raise any errors
+
+    def test_fit_with_shared_step(self, teardown):
+        x = Input()
+        scaler = StandardScaler()
+        z = scaler(x, compute_func="transform", trainable=True)
+        y = scaler(z, compute_func="inverse_transform", trainable=False)
+        model = Model(x, y)
+        model.fit(np.array([1, 3, 1, 3]).reshape(-1, 1))
+        assert (scaler.mean_, scaler.var_) == (2.0, 1.0)
+
+    def test_fit_nested_model_with_multiple_inputs(self, teardown):
+        def build_model(step):
+            x1 = Input()
+            x2 = Input()
+            y_t1 = Input()
+            y_t2 = Input()
+            y_p = step([x1, x2], [y_t1, y_t2])
+            return Model([x1, x2], y_p, [y_t1, y_t2])
+
+        step = DummyMISO()
+        submodel = build_model(step)
+        model = build_model(submodel)
+
+        model.fit([iris.data, iris.data], [iris.target, iris.target])
+        assert step.fitted_
+
+    def test_fit_compute(self, teardown):
+        dummy_estimator_1 = DummyEstimator()
+        dummy_estimator_2 = DummyEstimator()
+
+        x = Input()
+        y_t = Input()
+        y_p1 = dummy_estimator_1(x, y_t, fit_compute_func=None)
+        y_p2 = dummy_estimator_2(x, y_t)
+        model = Model(x, [y_p1, y_p2], y_t)
+        model.fit(iris.data, iris.target)
+
+        assert dummy_estimator_1.fit_calls == 1
+        assert dummy_estimator_1.fit_predict_calls == 0
+        assert dummy_estimator_2.fit_calls == 0
+        assert dummy_estimator_2.fit_predict_calls == 1
 
 
 class TestPredict:
@@ -382,21 +436,23 @@ class TestPredict:
         with pytest.raises(ValueError):
             model.predict(
                 {"x1": self.x1_data, "x2": self.x2_data},
-                ["non-existing-output", "PCA_0/0"],
+                ["non-existing-output", "PCA_0/0/0"],
             )
 
     def test_with_unnecessary_input(self, model, teardown):
         # x2 is not needed to compute PCA_0/0
-        model.predict({"x1": self.x1_data, "x2": self.x2_data}, "PCA_0/0")
+        model.predict({"x1": self.x1_data, "x2": self.x2_data}, "PCA_0/0/0")
 
     def test_with_duplicated_output(self, model, teardown):
         with pytest.raises(ValueError):
             model.predict(
                 [self.x1_data, self.x2_data],
-                ["LogisticRegression_0/0", "LogisticRegression_0/0", "PCA_0/0"],
+                ["LogisticRegression_0/0/0", "LogisticRegression_0/0/0", "PCA_0/0/0"],
             )
 
-    @pytest.mark.parametrize("output", ["LogisticRegression_0/0", "StandardScaler_0/0"])
+    @pytest.mark.parametrize(
+        "output", ["LogisticRegression_0/0/0", "StandardScaler_0/0/0"]
+    )
     def test_with_specified_output(self, model, output, teardown):
         model.predict({"x1": self.x1_data}, output)
 
@@ -408,6 +464,7 @@ class TestPredict:
         with pytest.raises(RuntimeError):
             model.predict(iris.data)
 
+    @skip_sklearn_0_22
     def test_predict_with_not_fitted_steps(self, teardown):
         x_data = iris.data
 
@@ -418,6 +475,15 @@ class TestPredict:
         model = Model(x, y)
         with pytest.raises(NotFittedError):
             model.predict(x_data)
+
+    def test_predict_with_shared_step(self, teardown):
+        x1 = Input()
+        x2 = Input()
+        doubler = Lambda(lambda x: x * 2)
+        y1 = doubler(x1)
+        y2 = doubler(x2)
+        model = Model([x1, x2], [y1, y2])
+        assert model.predict([2, 3]) == [4, 6]
 
 
 def test_steps_cache(teardown):
@@ -436,17 +502,17 @@ def test_steps_cache(teardown):
     # 1) instantiation always misses
     misses += 1
     model = Model([x1, x2], [y1, y2], y1_t)
-    assert hits == model._steps_cache.hits and misses == model._steps_cache.misses
+    assert model._nodes_cache.hits == hits and model._nodes_cache.misses == misses
 
     # 2) calling fit for the first time, hence a miss
     misses += 1
     model.fit([x1_data, x2_data], y1_t_data)
-    assert hits == model._steps_cache.hits and misses == model._steps_cache.misses
+    assert model._nodes_cache.hits == hits and model._nodes_cache.misses == misses
 
     # 3) same as above, just different format, hence a hit
     hits += 1
     model.fit({x1: x1_data, x2: x2_data}, {y1_t: y1_t_data})
-    assert hits == model._steps_cache.hits and misses == model._steps_cache.misses
+    assert model._nodes_cache.hits == hits and model._nodes_cache.misses == misses
 
     # 4) trainable flags are considered in cache keys, hence a miss
     misses += 1
@@ -454,48 +520,48 @@ def test_steps_cache(teardown):
     model.fit(
         [x1_data, x2_data], y1_t_data
     )  # NOTE: target is superfluous, but it affects caching
-    assert hits == model._steps_cache.hits and misses == model._steps_cache.misses
+    assert model._nodes_cache.hits == hits and model._nodes_cache.misses == misses
 
     # 5) same as above, just different format, hence a hit
     hits += 1
     model.fit({x1: x1_data, x2: x2_data}, y1_t_data)
-    assert hits == model._steps_cache.hits and misses == model._steps_cache.misses
+    assert model._nodes_cache.hits == hits and model._nodes_cache.misses == misses
 
     # 6) we drop the (superflous) target, hence a miss
     misses += 1
     model.fit({x1: x1_data, x2: x2_data})
-    assert hits == model._steps_cache.hits and misses == model._steps_cache.misses
+    assert model._nodes_cache.hits == hits and model._nodes_cache.misses == misses
 
     # 7) same as above, hence a hit
     hits += 1
     model.fit({x1: x1_data, x2: x2_data})
-    assert hits == model._steps_cache.hits and misses == model._steps_cache.misses
+    assert model._nodes_cache.hits == hits and model._nodes_cache.misses == misses
 
     # 8) we restore the flag, becoming the same as 2) and 3), hence a hit
     hits += 1
     model.get_step("LogReg").trainable = True
     model.fit({x1: x1_data, x2: x2_data}, y1_t_data)
-    assert hits == model._steps_cache.hits and misses == model._steps_cache.misses
+    assert model._nodes_cache.hits == hits and model._nodes_cache.misses == misses
 
     # 9) new inputs/targets/outputs signature, hence a miss
     misses += 1
     model.predict([x1_data, x2_data])
-    assert hits == model._steps_cache.hits and misses == model._steps_cache.misses
+    assert model._nodes_cache.hits == hits and model._nodes_cache.misses == misses
 
     # 10) same inputs/outputs signature as 9), hence a hit
     hits += 1
-    model.predict({"x1": x1_data, "x2": x2_data}, ["PCA/0", "LogReg/0"])
-    assert hits == model._steps_cache.hits and misses == model._steps_cache.misses
+    model.predict({"x1": x1_data, "x2": x2_data}, ["PCA/0/0", "LogReg/0/0"])
+    assert model._nodes_cache.hits == hits and model._nodes_cache.misses == misses
 
     # 11) new inputs/outputs signature, hence a miss
     misses += 1
-    model.predict({x1: x1_data}, "LogReg/0")
-    assert hits == model._steps_cache.hits and misses == model._steps_cache.misses
+    model.predict({x1: x1_data}, "LogReg/0/0")
+    assert model._nodes_cache.hits == hits and model._nodes_cache.misses == misses
 
     # 12) same as above, hence a hit
     hits += 1
-    model.predict({x1: x1_data}, "LogReg/0")
-    assert hits == model._steps_cache.hits and misses == model._steps_cache.misses
+    model.predict({x1: x1_data}, "LogReg/0/0")
+    assert model._nodes_cache.hits == hits and model._nodes_cache.misses == misses
 
 
 def test_multiedge(teardown):
@@ -536,19 +602,28 @@ def test_transformed_target(teardown):
     assert_array_equal(model.get_step("LinearRegression_0").coef_, np.array([2.0]))
 
 
+def test_fit_predict_with_shared_step(teardown):
+    x = Input()
+    scaler = StandardScaler()
+    z = scaler(x, compute_func="transform", trainable=True)
+    y = scaler(z, compute_func="inverse_transform", trainable=False)
+    model = Model(x, y)
+
+    X_data = np.array([1, 3, 1, 3]).reshape(-1, 1)
+    model.fit(X_data)
+    assert_array_equal(model.predict(X_data), X_data)
+
+
 def test_fit_and_predict_model_with_no_fittable_steps(teardown):
-    X1_data = np.array([[1, 2], [3, 4]])
-    X2_data = np.array([[5, 6], [7, 8]])
-    y_expected = np.array([[12, 16], [20, 24]])
+    X_data = np.array([[1, 2], [3, 4]])
+    y_expected = np.array([[2, 4], [6, 8]])
 
-    x1 = Input()
-    x2 = Input()
-    z = DummyMISO()([x1, x2])
-    y = DummySISO()(z)
+    x = Input()
+    y = DummySISO()(x)
 
-    model = Model([x1, x2], y)
-    model.fit([X1_data, X2_data])  # nothing to fit
-    y_pred = model.predict([X1_data, X2_data])
+    model = Model(x, y)
+    model.fit(X_data)  # nothing to fit
+    y_pred = model.predict(X_data)
 
     assert_array_equal(y_pred, y_expected)
 
@@ -574,10 +649,8 @@ def test_fit_predict_pipeline(teardown):
     y_pred_baikal = model.fit(x_data, y_t_data).predict(x_data)
 
     # traditional way
-    pca = sklearn.decomposition.PCA(
-        n_components=n_components, random_state=random_state
-    )
-    logreg = sklearn.linear_model.LogisticRegression(
+    pca = PCA(n_components=n_components, random_state=random_state)
+    logreg = LogisticRegression(
         multi_class="multinomial", solver="lbfgs", random_state=random_state
     )
     x_data_transformed = pca.fit_transform(x_data)
@@ -588,8 +661,7 @@ def test_fit_predict_pipeline(teardown):
     assert_array_equal(y_pred_baikal, y_pred_traditional)
 
 
-def test_fit_predict_ensemble(teardown):
-    mask = iris.target != 2  # Reduce to binary problem to avoid ConvergenceWarning
+def test_fit_predict_naive_stack(teardown):
     x_data = iris.data
     y_t_data = iris.target
     random_state = 123
@@ -597,33 +669,85 @@ def test_fit_predict_ensemble(teardown):
     # baikal way
     x = Input()
     y_t = Input()
-    y1 = LogisticRegression(random_state=random_state)(x, y_t)
+    y1 = LogisticRegression(random_state=random_state, solver="liblinear")(x, y_t)
     y2 = RandomForestClassifier(random_state=random_state)(x, y_t)
     features = Stack(axis=1)([y1, y2])
-    y = LogisticRegression(random_state=random_state)(features, y_t)
+    y = LogisticRegression(random_state=random_state, solver="liblinear")(features, y_t)
 
     model = Model(x, y, y_t)
     model.fit(x_data, y_t_data)
     y_pred_baikal = model.predict(x_data)
 
     # traditional way
-    logreg = sklearn.linear_model.LogisticRegression(random_state=random_state)
+    logreg = LogisticRegression(random_state=random_state, solver="liblinear")
     logreg.fit(x_data, y_t_data)
     logreg_pred = logreg.predict(x_data)
 
-    random_forest = sklearn.ensemble.RandomForestClassifier(random_state=random_state)
+    random_forest = RandomForestClassifier(random_state=random_state)
     random_forest.fit(x_data, y_t_data)
     random_forest_pred = random_forest.predict(x_data)
 
     features = np.stack([logreg_pred, random_forest_pred], axis=1)
-    ensemble = sklearn.linear_model.LogisticRegression(random_state=random_state)
-    ensemble.fit(features, y_t_data)
-    y_pred_traditional = ensemble.predict(features)
+    stacked = LogisticRegression(random_state=random_state, solver="liblinear")
+    stacked.fit(features, y_t_data)
+    y_pred_traditional = stacked.predict(features)
 
     assert_array_equal(y_pred_baikal, y_pred_traditional)
 
 
-def test_fit_predict_ensemble_with_proba_features(teardown):
+@skip_sklearn_pre_0_22
+def test_fit_predict_standard_stack(teardown):
+    # This uses the "standard" protocol where the 2nd level features
+    # are the out-of-fold predictions of the 1st. It also appends the
+    # original data to the 2nd level features.
+    # See for example: https://www.kdnuggets.com/2017/02/stacking-models-imropved-predictions.html
+    X_data, y_t_data = breast_cancer.data, breast_cancer.target
+    X_train, X_test, y_t_train, y_t_test = train_test_split(
+        X_data, y_t_data, test_size=0.2, random_state=0
+    )
+    random_state = 42
+
+    # baikal way
+    x = Input()
+    y_t = Input()
+
+    y_p1 = RandomForestClassifierOOF(n_estimators=10, random_state=random_state)(
+        x, y_t, compute_func="predict_proba"
+    )
+    y_p1 = Lambda(lambda array: array[:, 1:])(y_p1)  # remove collinear feature
+
+    x_scaled = StandardScaler()(x)
+    y_p2 = LinearSVCOOF(random_state=random_state)(
+        x_scaled, y_t, compute_func="decision_function"
+    )
+
+    stacked_features = ColumnStack()([x, y_p1, y_p2])
+    y_p = LogisticRegression(solver="liblinear", random_state=random_state)(
+        stacked_features, y_t
+    )
+
+    model = Model(x, y_p, y_t)
+    model.fit(X_train, y_t_train)
+    y_pred_baikal = model.predict(X_test)
+
+    # traditional way
+    estimators = [
+        ("rf", RandomForestClassifier(n_estimators=10, random_state=random_state)),
+        ("svr", make_pipeline(StandardScaler(), LinearSVC(random_state=random_state))),
+    ]
+    clf = sklearn.ensemble.StackingClassifier(
+        estimators=estimators,
+        final_estimator=LogisticRegression(
+            solver="liblinear", random_state=random_state
+        ),
+        passthrough=True,
+    )
+    y_pred_traditional = clf.fit(X_train, y_t_train).predict(X_test)
+
+    assert_array_equal(y_pred_baikal, y_pred_traditional)
+
+
+def test_fit_predict_naive_stack_with_proba_features(teardown):
     mask = iris.target != 2  # Reduce to binary problem to avoid ConvergenceWarning
     x_data = iris.data[mask]
     y_t_data = iris.target[mask]
@@ -633,36 +757,43 @@ def test_fit_predict_ensemble_with_proba_features(teardown):
     # baikal way
     x = Input()
     y_t = Input()
-    y1 = LogisticRegression(random_state=random_state, function="predict_proba")(x, y_t)
-    y2 = RandomForestClassifier(
-        n_estimators=n_estimators, random_state=random_state, function="apply"
-    )(x, y_t)
-    features = Concatenate(axis=1)([y1, y2])
-    y = LogisticRegression(random_state=random_state)(features, y_t)
+    y_p1 = LogisticRegression(random_state=random_state)(
+        x, y_t, compute_func="predict_proba"
+    )
+    y_p2 = RandomForestClassifier(n_estimators=n_estimators, random_state=random_state)(
+        x, y_t, compute_func="apply"
+    )
+    y_p1 = Lambda(compute_func=lambda array: array[:, 1:])(y_p1)
+    y_p2 = Lambda(compute_func=lambda array: array[:, 1:])(y_p2)
+    features = Concatenate(axis=1)([y_p1, y_p2])
+    y_p = LogisticRegression(random_state=random_state)(features, y_t)
 
-    model = Model(x, y, y_t)
+    model = Model(x, y_p, y_t)
     model.fit(x_data, y_t_data)
     y_pred_baikal = model.predict(x_data)
 
     # traditional way
-    logreg = sklearn.linear_model.LogisticRegression(random_state=random_state)
+    logreg = LogisticRegression(random_state=random_state)
     logreg.fit(x_data, y_t_data)
     logreg_proba = logreg.predict_proba(x_data)
 
-    random_forest = sklearn.ensemble.RandomForestClassifier(
+    random_forest = RandomForestClassifier(
         n_estimators=n_estimators, random_state=random_state
     )
     random_forest.fit(x_data, y_t_data)
     random_forest_leafidx = random_forest.apply(x_data)
 
-    features = np.concatenate([logreg_proba, random_forest_leafidx], axis=1)
-    ensemble = sklearn.linear_model.LogisticRegression(random_state=random_state)
-    ensemble.fit(features, y_t_data)
-    y_pred_traditional = ensemble.predict(features)
+    features = np.concatenate(
+        [logreg_proba[:, 1:], random_forest_leafidx[:, 1:]], axis=1
+    )
+    stacked = LogisticRegression(random_state=random_state)
+    stacked.fit(features, y_t_data)
+    y_pred_traditional = stacked.predict(features)
 
     assert_array_equal(y_pred_baikal, y_pred_traditional)
 
 
+@skip_sklearn_0_22
 def test_nested_model(teardown):
     x_data = iris.data
     y_t_data = iris.target
@@ -690,54 +821,52 @@ def test_nested_model(teardown):
     assert_array_equal(y_pred, y_pred_sub)
 
 
-def test_nested_model_ensemble(teardown):
+def test_nested_model_stack(teardown):
     x_data = iris.data
     y_t_data = iris.target
     random_state = 123
     n_components = 2
 
     # ----------- baikal way
-    ensemble_model_baikal = make_ensemble_model(
+    stacked_model_baikal = make_naive_stacked_model(
         n_components, random_state, x_data, y_t_data
     )
-    y_pred_baikal = ensemble_model_baikal.predict(x_data)
+    y_pred_baikal = stacked_model_baikal.predict(x_data)
 
     # ----------- traditional way
     # Submodel 1
-    submodel1 = sklearn.linear_model.LogisticRegression(
+    submodel1 = LogisticRegression(
         multi_class="multinomial", solver="lbfgs", random_state=random_state
     )
-    pca = sklearn.decomposition.PCA(
-        n_components=n_components, random_state=random_state
-    )
+    pca = PCA(n_components=n_components, random_state=random_state)
     pca.fit(x_data)
     pca_trans = pca.transform(x_data)
     submodel1.fit(pca_trans, y_t_data)
     submodel1_pred = submodel1.predict(pca_trans)
 
-    # Submodel 2 (a nested ensemble model)
-    random_forest = sklearn.ensemble.RandomForestClassifier(random_state=random_state)
+    # Submodel 2 (a nested stacked model)
+    random_forest = RandomForestClassifier(random_state=random_state)
     random_forest.fit(x_data, y_t_data)
     random_forest_pred = random_forest.predict(x_data)
 
-    extra_trees = sklearn.ensemble.ExtraTreesClassifier(random_state=random_state)
+    extra_trees = ExtraTreesClassifier(random_state=random_state)
     extra_trees.fit(x_data, y_t_data)
     extra_trees_pred = extra_trees.predict(x_data)
 
     features = np.stack([random_forest_pred, extra_trees_pred], axis=1)
-    submodel2 = sklearn.linear_model.LogisticRegression(
+    submodel2 = LogisticRegression(
         multi_class="multinomial", solver="lbfgs", random_state=random_state
     )
     submodel2.fit(features, y_t_data)
     submodel2_pred = submodel2.predict(features)
 
-    # Ensemble model
+    # Stacked model
     features = np.stack([submodel1_pred, submodel2_pred], axis=1)
-    ensemble_model_traditional = sklearn.linear_model.LogisticRegression(
+    stacked_model_traditional = LogisticRegression(
         multi_class="multinomial", solver="lbfgs", random_state=random_state
     )
-    ensemble_model_traditional.fit(features, y_t_data)
-    y_pred_traditional = ensemble_model_traditional.predict(features)
+    stacked_model_traditional.fit(features, y_t_data)
+    y_pred_traditional = stacked_model_traditional.predict(features)
 
     assert_array_equal(y_pred_baikal, y_pred_traditional)
 
@@ -751,17 +880,17 @@ def test_model_joblib_serialization(teardown, dump, load):
     random_state = 123
     n_components = 2
 
-    ensemble_model_baikal = make_ensemble_model(
+    stacked_model_baikal = make_naive_stacked_model(
         n_components, random_state, x_data, y_t_data
     )
-    y_pred_baikal = ensemble_model_baikal.predict(x_data)
+    y_pred_baikal = stacked_model_baikal.predict(x_data)
 
     # Persist model to a file
     f = tempfile.TemporaryFile()
-    dump(ensemble_model_baikal, f)
+    dump(stacked_model_baikal, f)
     f.seek(0)
-    ensemble_model_baikal_2 = load(f)
-    y_pred_baikal_2 = ensemble_model_baikal_2.predict(x_data)
+    stacked_model_baikal_2 = load(f)
+    y_pred_baikal_2 = stacked_model_baikal_2.predict(x_data)
 
     assert_array_equal(y_pred_baikal_2, y_pred_baikal)
 
@@ -790,10 +919,8 @@ def test_fit_params(teardown):
     model.fit(x_data, y_t_data, **fit_params)
 
     # traditional way
-    pca = sklearn.decomposition.PCA(
-        n_components=n_components, random_state=random_state
-    )
-    logreg = sklearn.linear_model.LogisticRegression(
+    pca = PCA(n_components=n_components, random_state=random_state)
+    logreg = LogisticRegression(
         multi_class="multinomial", solver="lbfgs", random_state=random_state
     )
     pipe = Pipeline([("pca", pca), ("logreg", logreg)])
@@ -805,58 +932,46 @@ def test_fit_params(teardown):
 
 
 def test_get_params(teardown):
-    pca = PCA(name="pca")
-    logreg = LogisticRegression(name="logreg")
+    dummy1 = DummyEstimator(name="dummy1")
+    dummy2 = DummyEstimator(x=456, y="def", name="dummy2")
     concat = Concatenate(name="concat")  # a step without get_params/set_params
 
-    x = Input()
-    h = pca(x)
-    c = concat([x, h])
-    y = logreg(c)
-    model = Model(x, y)
+    # a meaningless pipeline that contains shared steps
+    x1 = Input()
+    x2 = Input()
+    h = dummy1(x1)
+    c = concat([x1, h])
+    y1 = dummy2(c)
+    y2 = dummy2(x2, compute_func=lambda X: X * 2, trainable=False)
+    model = Model([x1, x2], [y1, y2])
 
     expected = {
-        "pca": pca,
-        "logreg": logreg,
+        "dummy1": dummy1,
+        "dummy2": dummy2,
         "concat": concat,
-        "pca__n_components": None,
-        "pca__whiten": False,
-        "pca__tol": 0.0,
-        "pca__svd_solver": "auto",
-        "pca__copy": True,
-        "pca__random_state": None,
-        "pca__iterated_power": "auto",
-        "logreg__C": 1.0,
-        "logreg__class_weight": None,
-        "logreg__dual": False,
-        "logreg__fit_intercept": True,
-        "logreg__intercept_scaling": 1,
-        "logreg__max_iter": 100,
-        "logreg__multi_class": "warn",
-        "logreg__n_jobs": None,
-        "logreg__penalty": "l2",
-        "logreg__random_state": None,
-        "logreg__solver": "warn",
-        "logreg__tol": 0.0001,
-        "logreg__verbose": 0,
-        "logreg__warm_start": False,
-        "logreg__l1_ratio": None,
+        "dummy1__x": 123,
+        "dummy1__y": "abc",
+        "dummy2__x": 456,
+        "dummy2__y": "def",
     }
 
     params = model.get_params()
-    assert expected == params
+    assert params == expected
 
 
 def test_set_params(teardown):
-    pca = PCA(name="pca")
-    classifier = RandomForestClassifier(name="classifier")
+    dummy1 = DummyEstimator(name="dummy1")
+    dummy2 = DummyEstimator(x=456, y="def", name="dummy2")
     concat = Concatenate(name="concat")  # a step without get_params/set_params
 
-    x = Input()
-    h = pca(x)
-    c = concat([x, h])
-    y = classifier(c)
-    model = Model(x, y)
+    # a meaningless pipeline that contains shared steps
+    x1 = Input()
+    x2 = Input()
+    h = dummy1(x1)
+    c = concat([x1, h])
+    y1 = dummy2(c)
+    y2 = dummy2(x2, compute_func=lambda X: X * 2, trainable=False)
+    model = Model([x1, x2], [y1, y2])
 
     # Fails when setting params on step that does not implement set_params
     new_params_wrong = {"concat__axis": 2}
@@ -869,67 +984,59 @@ def test_set_params(teardown):
         model.set_params(**new_params_wrong)
 
     # Fails when setting a non-existent param in a step
-    new_params_wrong = {"pca__non_existent_param": 42}
+    new_params_wrong = {"dummy1__non_existent_param": 42}
     with pytest.raises(ValueError):
         model.set_params(**new_params_wrong)
 
-    new_classifier = LogisticRegression()
+    new_dummy = DummyEstimator()
     new_params = {
-        "classifier": new_classifier,
-        "pca__n_components": 4,
-        "pca__whiten": True,
-        "classifier__C": 100.0,
-        "classifier__fit_intercept": False,
-        "classifier__penalty": "l1",
+        "dummy2": new_dummy,
+        "dummy1__x": 100,
+        "dummy1__y": "pqr",
+        "dummy2__x": 789,
+        "dummy2__y": "ijk",
     }
 
     model.set_params(**new_params)
     params = model.get_params()
 
     expected = {
-        "pca": pca,
-        "classifier": new_classifier,
+        "dummy1": dummy1,
+        "dummy2": new_dummy,
         "concat": concat,
-        "pca__n_components": 4,
-        "pca__whiten": True,
-        "pca__tol": 0.0,
-        "pca__svd_solver": "auto",
-        "pca__copy": True,
-        "pca__random_state": None,
-        "pca__iterated_power": "auto",
-        "classifier__C": 100.0,
-        "classifier__class_weight": None,
-        "classifier__dual": False,
-        "classifier__fit_intercept": False,
-        "classifier__intercept_scaling": 1,
-        "classifier__max_iter": 100,
-        "classifier__multi_class": "warn",
-        "classifier__n_jobs": None,
-        "classifier__penalty": "l1",
-        "classifier__random_state": None,
-        "classifier__solver": "warn",
-        "classifier__tol": 0.0001,
-        "classifier__verbose": 0,
-        "classifier__warm_start": False,
-        "classifier__l1_ratio": None,
+        "dummy1__x": 100,
+        "dummy1__y": "pqr",
+        "dummy2__x": 789,
+        "dummy2__y": "ijk",
     }
 
-    assert expected == params
+    assert params == expected
+
+    # Connectivity of the new step should be the same as the old step
+    assert new_dummy.name is dummy2.name
+    for port in range(2):
+        assert new_dummy.get_inputs_at(port) is dummy2.get_inputs_at(port)
+        assert new_dummy.get_outputs_at(port) is dummy2.get_outputs_at(port)
+        assert new_dummy.get_targets_at(port) is dummy2.get_targets_at(port)
+        assert new_dummy.get_trainable_at(port) is dummy2.get_trainable_at(port)
+        assert new_dummy.get_compute_func_at(port) is dummy2.get_compute_func_at(port)
 
 
 def test_get_set_params_invariance(teardown):
-    pca = PCA(name="pca")
-    classifier = RandomForestClassifier(name="classifier")
+    scaler = StandardScaler(name="scaler")
+    regressor = LinearRegression(name="regressor")
 
     x = Input()
-    h = pca(x)
-    y = classifier(h)
-    model = Model(x, y)
+    y_t = Input()
+    y_t_scaled = scaler(y_t)
+    y_p_scaled = regressor(x, y_t_scaled)
+    y_p = scaler(y_p_scaled, compute_func="inverse_transform", trainable=False)
+    model = Model(x, y_p, y_t)
 
     params1 = model.get_params()
     model.set_params(**params1)
     params2 = model.get_params()
-    assert params1 == params2
+    assert params2 == params1
 
 
 def test_trainable_flag(teardown):
@@ -938,7 +1045,7 @@ def test_trainable_flag(teardown):
     random_state = 123
     n_components = 2
 
-    ensemble_model_baikal = make_ensemble_model(
+    stacked_model_baikal = make_naive_stacked_model(
         n_components, random_state, x_data, y_t_data
     )
 
@@ -949,27 +1056,23 @@ def test_trainable_flag(teardown):
     idx = np.random.choice(np.arange(len(x_data)), size=n_samples, replace=False)
     x_data_sub, y_t_data_sub = x_data[idx], y_t_data[idx]
 
-    logreg_sub1 = ensemble_model_baikal.get_step("submodel1").get_step("logreg_sub1")
-    logreg_ensemble = ensemble_model_baikal.get_step("logreg_ensemble")
+    logreg_sub1 = stacked_model_baikal.get_step("submodel1").get_step("logreg_sub1")
+    logreg_stacked = stacked_model_baikal.get_step("logreg_stacked")
 
     logreg_sub1_coef_original = logreg_sub1.coef_.copy()  # This one should not change
-    logreg_ensemble_coef_original = (
-        logreg_ensemble.coef_.copy()
-    )  # This one should change
+    logreg_stacked_coef_original = logreg_stacked.coef_.copy()  # This one should change
     logreg_sub1.trainable = False
 
-    ensemble_model_baikal.fit(x_data_sub, y_t_data_sub)
+    stacked_model_baikal.fit(x_data_sub, y_t_data_sub)
     logreg_sub1_coef_retrained = logreg_sub1.coef_
-    logreg_ensemble_coef_retrained = logreg_ensemble.coef_
+    logreg_stacked_coef_retrained = logreg_stacked.coef_
 
     assert_array_equal(logreg_sub1_coef_original, logreg_sub1_coef_retrained)
     with pytest.raises(AssertionError):
-        assert_array_equal(
-            logreg_ensemble_coef_original, logreg_ensemble_coef_retrained
-        )
+        assert_array_equal(logreg_stacked_coef_original, logreg_stacked_coef_retrained)
 
 
-def make_ensemble_model(n_components, random_state, x_data, y_t_data):
+def make_naive_stacked_model(n_components, random_state, x_data, y_t_data):
     # An unnecessarily complex Model
 
     # Sub-model 1
@@ -984,7 +1087,7 @@ def make_ensemble_model(n_components, random_state, x_data, y_t_data):
     )(h1, y1_t)
     submodel1 = Model(x1, y1, y1_t, name="submodel1")
 
-    # Sub-model 2 (a nested ensemble model)
+    # Sub-model 2 (a nested stacked model)
     x2 = Input(name="x2")
     y2_t = Input(name="y2_t")
     y2_1 = RandomForestClassifier(random_state=random_state, name="rforest_sub2")(
@@ -1002,7 +1105,7 @@ def make_ensemble_model(n_components, random_state, x_data, y_t_data):
     )(features, y2_t)
     submodel2 = Model(x2, y2, y2_t, name="submodel2")
 
-    # Ensemble of submodels
+    # Stack of submodels
     x = Input(name="x")
     y_t = Input(name="y_t")
     y1 = submodel1(x, y_t)
@@ -1012,10 +1115,10 @@ def make_ensemble_model(n_components, random_state, x_data, y_t_data):
         multi_class="multinomial",
         solver="lbfgs",
         random_state=random_state,
-        name="logreg_ensemble",
+        name="logreg_stacked",
     )(features, y_t)
-    ensemble_model_baikal = Model(x, y, y_t, name="ensemble")
+    stacked_model_baikal = Model(x, y, y_t, name="stacked")
 
-    ensemble_model_baikal.fit(x_data, y_t_data)
+    stacked_model_baikal.fit(x_data, y_t_data)
 
-    return ensemble_model_baikal
+    return stacked_model_baikal

@@ -12,11 +12,6 @@ from baikal.sklearn import SKLearnWrapper
 from tests.helpers.sklearn_steps import PCA, LogisticRegression, RandomForestClassifier
 
 
-pytestmark = pytest.mark.filterwarnings(
-    "ignore::DeprecationWarning:sklearn", "ignore::FutureWarning:sklearn"
-)
-
-
 iris = datasets.load_iris()
 x_data = iris.data
 y_t_data = iris.target
@@ -37,11 +32,15 @@ def test_grid_search_cv():
         x = Input()
         y_t = Input()
         h = PCA(random_state=random_state, name="pca")(x)
-        y = LogisticRegression(random_state=random_state, name="logreg")(h, y_t)
+        y = LogisticRegression(
+            random_state=random_state, solver="liblinear", name="logreg"
+        )(h, y_t)
         model = Model(x, y, y_t)
         return model
 
     sk_model = SKLearnWrapper(build_fn)
+    assert isinstance(sk_model.model, Model)
+
     gscv_baikal = GridSearchCV(
         sk_model,
         param_grid,
@@ -53,8 +52,8 @@ def test_grid_search_cv():
     gscv_baikal.fit(x_data, y_t_data)
 
     # traditional way
-    pca = sklearn.decomposition.PCA(random_state=random_state)
-    logreg = sklearn.linear_model.LogisticRegression(random_state=random_state)
+    pca = PCA(random_state=random_state)
+    logreg = LogisticRegression(random_state=random_state, solver="liblinear")
     pipe = Pipeline([("pca", pca), ("logreg", logreg)])
 
     gscv_traditional = GridSearchCV(
@@ -67,7 +66,7 @@ def test_grid_search_cv():
     )
     gscv_traditional.fit(x_data, y_t_data)
 
-    assert gscv_traditional.best_params_ == gscv_baikal.best_params_
+    assert gscv_baikal.best_params_ == gscv_traditional.best_params_
     assert_array_equal(
         gscv_traditional.cv_results_["mean_train_score"],
         gscv_baikal.cv_results_["mean_train_score"],
@@ -108,8 +107,8 @@ def test_grid_search_cv_with_tunable_step():
     gscv_baikal.fit(x_data, y_t_data)
 
     # traditional way
-    pca = sklearn.decomposition.PCA(random_state=random_state)
-    classifier = sklearn.linear_model.LogisticRegression(random_state=random_state)
+    pca = PCA(random_state=random_state)
+    classifier = LogisticRegression(random_state=random_state)
     pipe = Pipeline([("pca", pca), ("classifier", classifier)])
 
     gscv_traditional = GridSearchCV(
@@ -122,7 +121,7 @@ def test_grid_search_cv_with_tunable_step():
     )
     gscv_traditional.fit(x_data, y_t_data)
 
-    assert gscv_traditional.best_params_ == gscv_baikal.best_params_
+    assert gscv_baikal.best_params_ == gscv_traditional.best_params_
     assert_array_equal(
         gscv_traditional.cv_results_["mean_train_score"],
         gscv_baikal.cv_results_["mean_train_score"],

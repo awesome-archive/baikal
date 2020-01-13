@@ -10,6 +10,15 @@ A graph-based functional API for building complex scikit-learn pipelines.
 
 **baikal** is written in pure Python. It supports Python 3.5 and above.
 
+Note: **baikal** is still a young project and there might be backward incompatible changes. The next development steps and backwards-incompatible changes are announced and discussed in [this issue](https://github.com/alegonz/baikal/issues/16). Please subscribe to it if you use **baikal**.
+
+##### Documentation
+* [dev](https://github.com/alegonz/baikal/blob/master/README.md)
+* [0.2.x](https://github.com/alegonz/baikal/blob/release/v0.2.0/README.md)
+* [0.1.x](https://github.com/alegonz/baikal/blob/release/v0.1.0/README.md)
+
+Please refer to the [changelog](CHANGELOG.md) for the details on each release.
+
 ---
 *Contents:*
 1. **[Introduction](#introduction)**
@@ -95,9 +104,17 @@ The baikal API introduces three basic elements:
 
 ## Installation
 
+To install the latest released version from PyPI:
+
 ```bash
 pip install baikal
-``` 
+```
+
+If you wish to install the latest development version, you can do so with:
+
+```bash
+pip install git+https://github.com/alegonz/baikal.git@master#egg=baikal
+```
 
 ### Requirements
 
@@ -173,17 +190,27 @@ from baikal import Step
 
 # The order of inheritance is important!
 class LogisticRegression(Step, sklearn.linear_model.LogisticRegression):
-    def __init__(self, name=None, function=None, n_outputs=1, trainable=True, **kwargs):
-        super().__init__(
-            name=name,
-            function=function,
-            n_outputs=n_outputs,
-            trainable=trainable,
-            **kwargs
-        )
+    def __init__(self, name=None, n_outputs=1, **kwargs):
+        super().__init__(name=name,n_outputs=n_outputs,**kwargs)
 ```
 
 Other steps are defined similarly (omitted here for brevity).
+
+**baikal** can also handle steps with multiple input/outputs/targets. The base class may implement a predict/transform method (the compute function) that take multiple inputs and returns multiple outputs, and a fit method that takes multiple inputs and targets (native scikit-learn classes at present take one input, return one output, and take at most one target). In this case, the input/target arguments are expected to be a list of (typically) array-like objects, and the compute function is expected to return a list of array-like objects. For example, the base class may implement the methods like this:
+
+```python
+class SomeClass(BaseEstimator):
+    ...
+    def predict(self, Xs):
+        X1, X2 = Xs
+        # use X1, X2 to calculate y1, y2
+        return y1, y2
+
+    def fit(self, Xs, ys):
+        (X1, X2), (y1, y2) = Xs, ys
+        # use X1, X2, y1, y2 to fit the model
+        return self
+```
 
 ### 2. Build the model
 
@@ -214,9 +241,9 @@ y = SVC()(ensemble_features, y_t)
 model = Model([x1, x2], y, y_t)
 ```
 
-(*) Steps are called on and output DataPlaceHolders. DataPlaceholders are produced and consumed exclusively by Steps, so you do not need to instantiate these yourself.
+You can call the same step on different inputs and targets to reuse the step (similar to the concept of shared layers and nodes in Keras), and specify a different `compute_func`/`trainable` configuration on each call. This is achieved via "ports": each call creates a new port and associates the given configuration to it. You may access the configuration at each port using the `get_*_at(port)` methods.
 
-Note: Currently, calling the same step on different inputs and targets to reuse the step (similar to the concept of shared layers and nodes in Keras) is not supported. Calling a step twice on different inputs will override the connectivity from the first call. Support for shareable steps might be added in future releases.
+(*) Steps are called on and output DataPlaceholders. DataPlaceholders are produced and consumed exclusively by Steps, so you do not need to instantiate these yourself.
 
 ### 3. Train the model
 
@@ -363,22 +390,52 @@ In order to use the plot utility, you need to install [pydot](https://pypi.org/p
 
 ## Examples
 
-### Stacked classifiers
+### Stacked classifiers (naive protocol)
 
-Similar to the the example in the quick-start above, stacks of classifiers (or regressors) can be built like shown below. Note that you can specify the function the step should use for computation, in this case `function='predict_proba'` to use the label probabilities as the features of the meta-classifier.
+Similar to the the example in the quick-start above, (a naive) stacks of classifiers (or regressors) can be built like shown below. Note that you can specify the function the step should use for computation, in this case `compute_func='predict_proba'` to use the label probabilities as the features of the meta-classifier.
 
 ```python
 x = Input()
 y_t = Input()
-y1 = LogisticRegression(function="predict_proba")(x, y_t)
-y2 = RandomForestClassifier(function="predict_proba")(x, y_t)
-ensemble_features = Stack()([y1, y2])
-y = ExtraTreesClassifier()(ensemble_features, y_t)
+y_p1 = LogisticRegression()(x, y_t, compute_func="predict_proba")
+y_p2 = RandomForestClassifier()(x, y_t, compute_func="predict_proba")
+# predict_proba returns arrays whose columns sum to one, so we drop one column
+y_p1 = Lambda(lambda array: array[:, 1:])(y_p1)
+y_p2 = Lambda(lambda array: array[:, 1:])(y_p2)
+ensemble_features = ColumnStack()([y_p1, y_p2])
+y_p = ExtraTreesClassifier()(ensemble_features, y_t)
 
-model = Model(x, y, y_t)
+model = Model(x, y_p, y_t)
 ```
 
-Click [here](examples/stacked_classifiers.py) for a full example.
+Click [here](examples/stacked_classifiers_naive.py) for a full example.
+
+### Stacked classifiers (standard protocol)
+
+In the naive stack above, each classifier in the 1st level will calculate the predictions for the 2nd level using the same data it used for fitting its parameters. This is prone to overfitting as the 2nd level classifier will tend to give more weight to an overfit classifier in the 1st level. To avoid this, the standard protocol recommends that, during fit, the 1st level classifiers are still trained on the original data, but instead they provide out-of-fold (OOF) predictions to the 2nd level classifier. To achieve this special behavior, we leverage the `fit_compute_func` API: we define a `fit_predict` method that does the fitting and the OOF predictions, and add it as a method of the 1st level classifiers (`LogisticRegression` and `RandomForestClassifier`, in the example below) when making the steps. **baikal** will then detect and use this method during fit.
+
+```python
+from sklearn.model_selection import cross_val_predict
+
+
+def fit_predict(self, X, y):
+    self.fit(X, y)
+    return cross_val_predict(self, X, y, method="predict_proba")
+
+
+attr_dict = {"fit_predict": fit_predict}
+
+# 1st level classifiers
+LogisticRegression = make_step(sklearn.linear_model.LogisticRegression, attr_dict)
+RandomForestClassifier = make_step(sklearn.ensemble.RandomForestClassifier, attr_dict)
+
+# 2nd level classifier
+ExtraTreesClassifier = make_step(sklearn.ensemble.ExtraTreesClassifier)
+
+# The rest of the stack is build exactly the same as in the naive example.
+```
+
+Click [here](examples/stacked_classifiers_standard.py) for a full example.
 
 ### Classifier chain
 
@@ -407,17 +464,26 @@ Click [here](examples/classifier_chain.py) for a full example.
 
 Sure, scikit-learn already does have [`ClassifierChain`](https://scikit-learn.org/stable/modules/generated/sklearn.multioutput.ClassifierChain.html#sklearn.multioutput.ClassifierChain) and [`RegressorChain`](https://scikit-learn.org/stable/modules/generated/sklearn.multioutput.RegressorChain.html#sklearn.multioutput.RegressorChain) classes for this. But with **baikal** you could, for example, mix classifiers and regressors to predict multilabels that include both categorical and continuous labels.
 
-## Next development steps
-- [x] Make a step class factory function.
-- [x] Treat targets as first-class citizens in the Model. Currently, targets are not treated like formal inputs of the graph, and the only way a Model handles them is via the `Model.fit` interface, which makes difficult applying steps to them (e.g. log transformation on regression targets).
-- [ ] (**in progress**) Add parallelization to `Model.fit` and `Model.predict` (using joblib `Parallel` API).
-- [ ] Add caching of intermediate results to `Model.fit` and `Model.predict` (using joblib `Memory` API).
-- [ ] Make a custom `GridSearchCV` API, based on the original scikit-learn implementation, that can handle baikal models with multiple inputs and outputs natively.
-- [ ] Make steps shareable.
-- [ ] Add support for steps that can take extra options in their predict method.
-- [ ] Grow the merge steps module and add support for data structures other than numpy arrays (e.g. pandas dataframes). Some steps that could be added are: 
-    - Single array aggregation (sum, average, maximum, minimum, etc).
-    - Element-wise aggregation of multiple arrays.
+### Transformed target
+
+You can also call steps on the targets to apply transformations on them. Note that by making the transformed a shared step, you can re-use learned parameters to apply the inverse transform later in the pipeline.
+
+```python
+transformer = QuantileTransformer(n_quantiles=300, output_distribution="normal")
+
+x = Input()
+y_t = Input()
+# QuantileTransformer requires an explicit feature dimension, hence the Lambda step
+y_t_trans = Lambda(np.reshape, newshape=(-1, 1))(y_t)
+y_t_trans = transformer(y_t_trans)
+y_p_trans = RidgeCV()(x, y_t_trans)
+y_p = transformer(y_p_trans, compute_func="inverse_transform", trainable=False)
+# Note that transformer is a shared step since it was called twice
+
+model = Model(x, y_p, y_t)
+```
+
+Click [here](examples/transformed_target.py) for a full example.
 
 ## Contributing
 

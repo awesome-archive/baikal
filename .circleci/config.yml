@@ -1,11 +1,17 @@
-version: 2
+version: 2.1
+
+sklearn_version_latest: &sklearn_version_latest 0.22.*
+sklearn_version_prev: &sklearn_version_prev 0.21.*
 
 test-defaults: &test-defaults
+  parameters:
+    sklearn_version:
+      type: string
   working_directory: ~/baikal
   steps:
     - checkout
     - run: |
-        sudo -E ./ci_tools/test_job.sh
+        sudo -E ./ci_tools/test_job.sh << parameters.sklearn_version >>
 
 build-defaults: &build-defaults
   working_directory: ~/baikal
@@ -13,22 +19,22 @@ build-defaults: &build-defaults
     - image: circleci/python:3.7.3-stretch
 
 jobs:
-  test-py3.5:
-    <<: *test-defaults
-    docker:
-      - image: circleci/python:3.5.7-stretch
-
-  test-py3.6:
+  test-py36:
     <<: *test-defaults
     docker:
       - image: circleci/python:3.6.8-stretch
 
-  test-py3.7:
+  test-py37:
     <<: *test-defaults
     docker:
       - image: circleci/python:3.7.3-stretch
     environment:
       RUN_TEST_WITH_COVERAGE: 1
+
+  test-py38:
+    <<: *test-defaults
+    docker:
+      - image: circleci/python:3.8.0-buster
 
   build-wheel:
     <<: *build-defaults
@@ -53,15 +59,28 @@ jobs:
           sudo -E make upload
 
 workflows:
-  version: 2
+  version: 2.1
   build-deploy:
     jobs:
-      - test-py3.5
-      - test-py3.6
-      - test-py3.7
+      - test-py36:
+          sklearn_version: *sklearn_version_prev
+      - test-py36:
+          sklearn_version: *sklearn_version_latest
+
+      - test-py37:
+          sklearn_version: *sklearn_version_prev
+      - test-py37:
+          name: test-main
+          sklearn_version: *sklearn_version_latest
+
+      # For py3.8 we only test 0.22.* or above
+      # see: https://github.com/scikit-learn/scikit-learn/issues/15328
+      - test-py38:
+          sklearn_version: *sklearn_version_latest
+
       - build-wheel:
           requires:
-            - test-py3.7
+            - test-main
       - upload-wheel-approval:
           type: approval
           requires:
@@ -72,3 +91,19 @@ workflows:
       - upload-wheel:
           requires:
             - upload-wheel-approval
+  nightly:
+    triggers:
+      - schedule:
+          # every day at 00:00 JST
+          cron: "0 15 * * *"
+          filters:
+            branches:
+              only:
+                - master
+    jobs:
+      - test-py36:
+          sklearn_version: "nightly"
+      - test-py37:
+          sklearn_version: "nightly"
+      - test-py38:
+          sklearn_version: "nightly"
